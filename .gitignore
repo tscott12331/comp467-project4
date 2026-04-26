@@ -8,3 +8,7 @@ wheels/
 
 # Virtual environments
 .venv
+
+# videos
+*.mov
+*.mp4
