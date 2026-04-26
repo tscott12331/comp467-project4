@@ -12,3 +12,6 @@ wheels/
 # videos
 *.mov
 *.mp4
+
+# env
+.env

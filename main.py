@@ -1,5 +1,8 @@
+import json
+import time
+import sys
 import re
-from typing import Tuple
+from typing import Any, Iterable, Tuple
 import pandas
 
 import pymongo
@@ -140,15 +143,17 @@ def get_fps(vstream: dict) -> float:
 def get_range_parts(entry_frames:str) -> list[str]:
     return entry_frames.split('-')
 
-def get_frames_with_handles(range_parts: list[str], handle_len: float, fps: float) -> Tuple[float, float]:
+def get_frames_with_handles(range_parts: list[str], handle_len: float, fps: float) -> Tuple[int, int]:
     handle_frames = handle_len * fps
-    start = max(float(range_parts[0]) - handle_frames, 0)
-    end = float(range_parts[1]) + handle_frames
+    start = max(int(range_parts[0]) - handle_frames, 0)
+    end = int(range_parts[1]) + handle_frames
+    start = int(start)
+    end = int(end)
 
     return (start, end)
 
 # needs fps info
-def get_range_handles_below(frame_data: list[dict[str, str]], threshold: int, fps: float) -> list[dict[str, Tuple[float, float]]]:
+def get_range_handles_below_thresh(frame_data: list[dict[str, str]], threshold: int, fps: float) -> list[dict[str, Any]]:
     ranges = []
     for entry in frame_data:
         entry_frames = entry['Frames']
@@ -165,7 +170,8 @@ def get_range_handles_below(frame_data: list[dict[str, str]], threshold: int, fp
         new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, fps)
         ranges.append({
             'Path': entry['Path'],
-            'Frames': new_frames
+            'Frames': entry['Frames'],
+            'Handles': new_frames
             })
 
     return ranges
@@ -184,7 +190,58 @@ def frames_to_timecode(frames: int):
 
     return(f'{str(hours).zfill(2)}:{str(minutes).zfill(2)}:{str(seconds).zfill(2)}:{str(frames).zfill(2)}')
 
-            
+def ffmpeg_run(sequence):
+    try:
+        sequence.run(capture_stdout=True, capture_stderr=True)
+    except ffmpeg.Error as e:
+        raise Exception(f"ffmpeg error: {e.stderr.decode()}")
+
+def create_video_snippet(video_path: Path, out_path: Path, handles: Tuple[int, int], fps: float):
+    start, end = handles
+    start_sec = start / fps
+    end_sec = end / fps
+    input = ffmpeg.input(str(video_path))
+    trimmed_video = (
+        input.video
+            .filter('trim', start_frame=start, end_frame=end)
+            .setpts('PTS-STARTPTS')
+        )
+
+    trimmed_audio = (
+        input.audio
+            .filter('atrim', start=start_sec, end=end_sec)
+            .filter('asetpts', 'PTS-STARTPTS')
+        )
+
+    sequence = (
+        ffmpeg
+            .output(trimmed_video, trimmed_audio, str(out_path), fps_mode='passthrough')
+            .overwrite_output()
+        )
+
+    # sequence = (
+    #     ffmpeg
+    #         .input(str(video_path))
+    #         .filter('trim', start={start}, end={end})
+    #         .filter('atrim', start={start}, end={end})
+    #         # .filter('select', f'between(n,{start},{end})')
+    #         # .filter('setpts', 'N/FRAME_RATE/TB')
+    #         .output(str(out_path), fps_mode='passthrough')
+    #         .overwrite_output()
+    #     )
+
+    ffmpeg_run(sequence)
+    print(f'Created snippet from frames {start} to {end} at {out_path}')
+
+
+def create_snippets(video_path: Path, handles: Iterable[Tuple[int, int]], fps:float):
+    tmp_folder_path = Path(f'tmp_{time.time()}')
+    tmp_folder_path.mkdir(parents=True, exist_ok=True)
+
+    for handle in handles:
+        start, end = handle
+        out_path = tmp_folder_path / f'{video_path.stem}_{start}_{end}{video_path.suffix}'
+        create_video_snippet(video_path, out_path, handle, fps)
 
 
 def init_mongodb() -> Database:
@@ -195,21 +252,28 @@ def init_mongodb() -> Database:
 
 def main():
     args = conf_argparse()
+    video_path = Path(args.process)
 
     baselight = args.baselight
     xytech = args.xytech
 
-    df = get_frame_data(baselight, xytech)
-    db = init_mongodb()
-    frame_data_col = insert_frame_data(df, db, "frame-data")
-    frame_data = list(frame_data_col.find({}, { '_id': 0 }))
+    try:
+        # TODO: maybe only process these if there's nothing in db
+        df = get_frame_data(baselight, xytech)
+        db = init_mongodb()
+        frame_data_col = insert_frame_data(df, db, "frame-data")
+        frame_data = list(frame_data_col.find({}, { '_id': 0 }))
 
-    video_data = ffmpeg.probe(args.process)
-    vstream = get_video_stream(video_data)
-    nb_frames = get_total_frames(vstream)
-    fps = get_fps(vstream)
+        video_data = ffmpeg.probe(str(video_path))
+        vstream = get_video_stream(video_data)
+        nb_frames = get_total_frames(vstream)
+        fps = get_fps(vstream)
 
-    ranges = get_range_handles_below(frame_data, nb_frames, fps)
+        # TODO: could change frame_data in place
+        frame_data = get_range_handles_below_thresh(frame_data, nb_frames, fps)
+        create_snippets(video_path, (entry['Handles'] for entry in frame_data), fps)
+    except Exception as e:
+        print(f"ERROR: {e}", file=sys.stderr)
 
 
 
