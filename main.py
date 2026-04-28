@@ -2,14 +2,18 @@ import json
 import time
 import sys
 import re
-from typing import Any, Iterable, Tuple
+from typing import Annotated, Any, Iterable, Literal, Optional, Tuple, TypedDict, Union
 import pandas
 
+from pydantic import Field
+from pydantic.config import ConfigDict
 import pymongo
 from pymongo.synchronous.collection import Collection
 from pymongo.synchronous.database import Database
 from pymongo.typings import _Pipeline
+from pydantic.dataclasses import dataclass
 from pathlib import Path
+from vimeo import VimeoClient
 import argparse
 import ffmpeg
 
@@ -18,27 +22,124 @@ SECOND_FRAMES = 24
 MINUTE_FRAMES = SECOND_FRAMES * 60
 HOUR_FRAMES = MINUTE_FRAMES * 60
 
+DEF_COL_NAME = "frame_data"
+
+@dataclass
+class FramePaths:
+    baselight: Path
+    xytech: Path
+
+
+# arbitrary type config needed for pymongo Collection type
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class InsertOnly:
+    config_type: Literal['insert_only']
+    frame_paths: FramePaths
+    col: Collection
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class InsertAndProcess:
+    config_type: Literal['insert_and_process']
+    frame_paths: FramePaths
+    col: Collection
+    video_path: Path
+    out_path: Path
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class ReadAndProcess:
+    config_type: Literal['read_and_process']
+    col: Collection
+    video_path: Path
+    out_path: Path
+
+@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
+class Pull:
+    config_type: Literal['pull']
+    out_path: Path
+
+Config = Annotated[Union[InsertOnly, InsertAndProcess, ReadAndProcess, Pull], Field(discriminator='config_type')]
+
+@dataclass
+class VideoData:
+    nb_frames: int
+    fps: float
+
+
+
+class FrameData(TypedDict):
+    Path: str
+    Frames: str
+
+class HandleFrameData(FrameData):
+    Handles: Tuple[int, int]
+
+
+
 
 def conf_argparse() -> argparse.Namespace:
     parser = argparse.ArgumentParser()
 
-    parser.add_argument('-b', '--baselight', help="path to baselight file", required=True)
-    parser.add_argument('-x', '--xytech', help="path to xytech file", required=True)
+    parser.add_argument('-b', '--baselight', help="path to baselight file")
+    parser.add_argument('-x', '--xytech', help="path to xytech file")
+
+    parser.add_argument('-c', '--collection', help="mongodb collection to store/retrieve data", default="frame_data")
     
-    parser.add_argument('-p', '--process', help="path to video to process", required=True)
+    parser.add_argument('-o', '--out', help="output path for processed frames xls or pulled vimeo data csv")
+    
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument('-p', '--process', help="path to video to process")
+    group.add_argument('-P', '--pull', help="pull vimeo video data", action="store_true")
 
     return parser.parse_args()
 
-def insert_frame_data(df: pandas.DataFrame, db: Database, col_name: str) -> Collection:
+def get_config(args: argparse.Namespace) -> Config:
+    col_name = args.collection or DEF_COL_NAME
+    db = init_mongodb()
     col = db[col_name]
-    
-    # # to persist data in developmennt
-    if col.find_one():
-        return col
 
+    baselight = args.baselight
+    xytech = args.xytech
+
+    if (baselight is not None) and (xytech is not None):
+        frame_paths = FramePaths(Path(baselight), Path(xytech))
+    elif (baselight is None) and (xytech is None):
+        frame_paths = None
+    else:
+        raise Exception("need to specify both baselight and xytech file or neither")
+
+    video_path_str = args.process
+    out_path_str = args.out
+    pull = args.pull
+
+    if video_path_str is None:
+        if pull:
+            assert out_path_str is not None, "pulling vimeo video data requires output path"
+            out_path = Path(out_path_str)
+            return Pull('pull', out_path)
+
+        assert frame_paths is not None, "if not processing video, specify baselight and xytech file to insert"
+        return InsertOnly('insert_only', frame_paths, col)
+    else:
+        assert out_path_str is not None, "processing video requires output path"
+        video_path = Path(video_path_str)
+        out_path = Path(out_path_str)
+        if frame_paths is None:
+            return ReadAndProcess('read_and_process', col, video_path, out_path)
+        else:
+            return InsertAndProcess('insert_and_process', frame_paths, col, video_path, out_path)
+        
+
+
+
+def insert_frame_data(col: Collection, df: pandas.DataFrame) -> Collection:
+    col.delete_many({})
     col.insert_many(df.to_dict(orient='records'))
 
     return col
+
+def insert_frame_files(baselight_path: Path, xytech_path: Path, col: Collection):
+    df = get_frame_data(str(baselight_path), str(xytech_path))
+    insert_frame_data(col, df)
 
 # match path after prefix for xytech file paths
 xytech_path_re = r'(/hpsans\d{2}/production/)([A-Za-z0-9/\-_]+)'
@@ -152,9 +253,8 @@ def get_frames_with_handles(range_parts: list[str], handle_len: float, fps: floa
 
     return (start, end)
 
-# needs fps info
-def get_range_handles_below_thresh(frame_data: list[dict[str, str]], threshold: int, fps: float) -> list[dict[str, Any]]:
-    ranges = []
+def get_range_handles_below_thresh(frame_data: list[FrameData], threshold: int, fps: float) -> list[HandleFrameData]:
+    ranges: list[HandleFrameData] = []
     for entry in frame_data:
         entry_frames = entry['Frames']
         range_parts = get_range_parts(entry_frames)
@@ -169,8 +269,7 @@ def get_range_handles_below_thresh(frame_data: list[dict[str, str]], threshold: 
 
         new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, fps)
         ranges.append({
-            'Path': entry['Path'],
-            'Frames': entry['Frames'],
+            **entry,
             'Handles': new_frames
             })
 
@@ -219,17 +318,6 @@ def create_video_snippet(video_path: Path, out_path: Path, handles: Tuple[int, i
             .overwrite_output()
         )
 
-    # sequence = (
-    #     ffmpeg
-    #         .input(str(video_path))
-    #         .filter('trim', start={start}, end={end})
-    #         .filter('atrim', start={start}, end={end})
-    #         # .filter('select', f'between(n,{start},{end})')
-    #         # .filter('setpts', 'N/FRAME_RATE/TB')
-    #         .output(str(out_path), fps_mode='passthrough')
-    #         .overwrite_output()
-    #     )
-
     ffmpeg_run(sequence)
     print(f'Created snippet from frames {start} to {end} at {out_path}')
 
@@ -250,28 +338,59 @@ def init_mongodb() -> Database:
 
     return db
 
+def read_frame_data(col: Collection) -> list[FrameData]:
+    return list(col.find({}, { '_id': 0 }))
+
+
+def get_video_data(video_path: Path) -> VideoData:
+    video_data = ffmpeg.probe(str(video_path))
+    vstream = get_video_stream(video_data)
+    nb_frames = get_total_frames(vstream)
+    fps = get_fps(vstream)
+    return VideoData(nb_frames, fps)
+
+def process_collection(video_path: Path, col: Collection):
+    frame_data = read_frame_data(col)
+    process(video_path, frame_data)
+
+def process(video_path: Path, frame_data: list[FrameData]):
+    video_data = get_video_data(video_path)
+
+    # TODO: could change frame_data in place
+    handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
+
+    handles = (entry['Handles'] for entry in handle_frame_data)
+    create_snippets(video_path, handles, video_data.fps)
+
+def pull_action(c: Pull):
+    raise NotImplementedError()
+
+def insert_only_action(c: InsertOnly):
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
+
+def insert_and_process_action(c: InsertAndProcess):
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
+    process_collection(c.video_path, c.col)
+
+
+def read_and_process_action(c: ReadAndProcess):
+    process_collection(c.video_path, c.col)
+
+
 def main():
-    args = conf_argparse()
-    video_path = Path(args.process)
-
-    baselight = args.baselight
-    xytech = args.xytech
-
     try:
-        # TODO: maybe only process these if there's nothing in db
-        df = get_frame_data(baselight, xytech)
-        db = init_mongodb()
-        frame_data_col = insert_frame_data(df, db, "frame-data")
-        frame_data = list(frame_data_col.find({}, { '_id': 0 }))
+        args = conf_argparse()
+        config = get_config(args)
 
-        video_data = ffmpeg.probe(str(video_path))
-        vstream = get_video_stream(video_data)
-        nb_frames = get_total_frames(vstream)
-        fps = get_fps(vstream)
-
-        # TODO: could change frame_data in place
-        frame_data = get_range_handles_below_thresh(frame_data, nb_frames, fps)
-        create_snippets(video_path, (entry['Handles'] for entry in frame_data), fps)
+        match config:
+            case Pull() as c:
+                pull_action(c)
+            case InsertOnly() as c:
+                insert_only_action(c)
+            case InsertAndProcess() as c:
+                insert_and_process_action(c)
+            case ReadAndProcess() as c:
+                read_and_process_action(c)
     except Exception as e:
         print(f"ERROR: {e}", file=sys.stderr)
 
