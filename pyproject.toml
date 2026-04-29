@@ -9,5 +9,6 @@ dependencies = [
     "pandas>=3.0.2",
     "pydantic>=2.13.3",
     "pymongo>=4.17.0",
+    "python-dotenv>=1.2.2",
     "pyvimeo>=1.1.2",
 ]

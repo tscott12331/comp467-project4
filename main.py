@@ -1,18 +1,17 @@
-import json
+import os
 import time
 import sys
 import re
-from typing import Annotated, Any, Iterable, Literal, Optional, Tuple, TypedDict, Union
+from typing import Annotated, Iterable, Literal, Tuple, TypedDict, Union
 import pandas
 
-from pydantic import Field
-from pydantic.config import ConfigDict
+from pydantic import BaseModel, ConfigDict, Field
 import pymongo
 from pymongo.synchronous.collection import Collection
 from pymongo.synchronous.database import Database
 from pymongo.typings import _Pipeline
-from pydantic.dataclasses import dataclass
 from pathlib import Path
+from dotenv import load_dotenv
 from vimeo import VimeoClient
 import argparse
 import ffmpeg
@@ -24,43 +23,48 @@ HOUR_FRAMES = MINUTE_FRAMES * 60
 
 DEF_COL_NAME = "frame_data"
 
-@dataclass
-class FramePaths:
+VIMEO_GET_VIDS_URL = "https://api.vimeo.com/me/videos"
+
+class FramePaths(BaseModel):
     baselight: Path
     xytech: Path
 
 
 # arbitrary type config needed for pymongo Collection type
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
-class InsertOnly:
+class InsertOnly(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     config_type: Literal['insert_only']
     frame_paths: FramePaths
     col: Collection
 
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
-class InsertAndProcess:
+class InsertAndProcess(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     config_type: Literal['insert_and_process']
     frame_paths: FramePaths
     col: Collection
     video_path: Path
     out_path: Path
 
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
-class ReadAndProcess:
+class ReadAndProcess(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     config_type: Literal['read_and_process']
     col: Collection
     video_path: Path
     out_path: Path
 
-@dataclass(config=ConfigDict(arbitrary_types_allowed=True))
-class Pull:
+class Pull(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
     config_type: Literal['pull']
     out_path: Path
+    vimeo_client: VimeoClient
 
 Config = Annotated[Union[InsertOnly, InsertAndProcess, ReadAndProcess, Pull], Field(discriminator='config_type')]
 
-@dataclass
-class VideoData:
+class VideoData(BaseModel):
     nb_frames: int
     fps: float
 
@@ -92,6 +96,17 @@ def conf_argparse() -> argparse.Namespace:
 
     return parser.parse_args()
 
+def get_vimeo_credentials():
+    client_id = os.getenv("VIMEO_CLIENT_ID")
+    assert client_id is not None, "missing VIMEO_CLIENT_ID in env"
+    client_secret = os.getenv("VIMEO_CLIENT_SECRET")
+    assert client_secret is not None, "missing VIMEO_CLIENT_SECRET in env"
+    access_token = os.getenv("VIMEO_ACCESS_TOKEN")
+    assert access_token is not None, "missing VIMEO_ACCESS_TOKEN in env"
+
+    return (client_id, client_secret, access_token)
+
+
 def get_config(args: argparse.Namespace) -> Config:
     col_name = args.collection or DEF_COL_NAME
     db = init_mongodb()
@@ -101,7 +116,7 @@ def get_config(args: argparse.Namespace) -> Config:
     xytech = args.xytech
 
     if (baselight is not None) and (xytech is not None):
-        frame_paths = FramePaths(Path(baselight), Path(xytech))
+        frame_paths = FramePaths(baselight=Path(baselight), xytech=Path(xytech))
     elif (baselight is None) and (xytech is None):
         frame_paths = None
     else:
@@ -115,18 +130,22 @@ def get_config(args: argparse.Namespace) -> Config:
         if pull:
             assert out_path_str is not None, "pulling vimeo video data requires output path"
             out_path = Path(out_path_str)
-            return Pull('pull', out_path)
+
+            client_id, client_secret, access_token = get_vimeo_credentials()
+            vimeo_client = VimeoClient(key=client_id, token=access_token, secret=client_secret)
+
+            return Pull(config_type='pull', out_path=out_path, vimeo_client=vimeo_client)
 
         assert frame_paths is not None, "if not processing video, specify baselight and xytech file to insert"
-        return InsertOnly('insert_only', frame_paths, col)
+        return InsertOnly(config_type='insert_only', frame_paths=frame_paths, col=col)
     else:
         assert out_path_str is not None, "processing video requires output path"
         video_path = Path(video_path_str)
         out_path = Path(out_path_str)
         if frame_paths is None:
-            return ReadAndProcess('read_and_process', col, video_path, out_path)
+            return ReadAndProcess(config_type='read_and_process', col=col, video_path=video_path, out_path=out_path)
         else:
-            return InsertAndProcess('insert_and_process', frame_paths, col, video_path, out_path)
+            return InsertAndProcess(config_type='insert_and_process', frame_paths=frame_paths, col=col, video_path=video_path, out_path=out_path)
         
 
 
@@ -347,7 +366,7 @@ def get_video_data(video_path: Path) -> VideoData:
     vstream = get_video_stream(video_data)
     nb_frames = get_total_frames(vstream)
     fps = get_fps(vstream)
-    return VideoData(nb_frames, fps)
+    return VideoData(nb_frames=nb_frames, fps=fps)
 
 def process_collection(video_path: Path, col: Collection):
     frame_data = read_frame_data(col)
@@ -363,8 +382,19 @@ def process(video_path: Path, frame_data: list[FrameData]):
     create_snippets(video_path, handles, video_data.fps)
 
 def pull_action(c: Pull):
-    raise NotImplementedError()
+    res = c.vimeo_client.get(VIMEO_GET_VIDS_URL)
+    json_data = res.json()
+    videos = json_data['data']
+    videos = map(lambda v: {
+                'Title': v['name'],
+                'URI': v['uri'],
+                'Link': v['link'],
+                'Status': v['status'],
+            }, videos)
 
+    df = pandas.DataFrame.from_records(videos)
+
+    df.to_csv(c.out_path)
 def insert_only_action(c: InsertOnly):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
 
@@ -379,6 +409,7 @@ def read_and_process_action(c: ReadAndProcess):
 
 def main():
     try:
+        load_dotenv()
         args = conf_argparse()
         config = get_config(args)
 
