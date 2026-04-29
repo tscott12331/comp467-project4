@@ -13,5 +13,10 @@ wheels/
 *.mov
 *.mp4
 
+# images
+*.png
+*.jpg
+*.webp
+
 # env
 .env

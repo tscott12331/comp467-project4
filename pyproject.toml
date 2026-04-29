@@ -11,4 +11,5 @@ dependencies = [
     "pymongo>=4.17.0",
     "python-dotenv>=1.2.2",
     "pyvimeo>=1.1.2",
+    "xlsxwriter>=3.2.9",
 ]

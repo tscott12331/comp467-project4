@@ -1,9 +1,11 @@
+import inspect
 import os
 import time
 import sys
 import re
-from typing import Annotated, Iterable, Literal, Tuple, TypedDict, Union
+from typing import Annotated, Iterable, Literal, Tuple, TypedDict, Union, cast
 import pandas
+from xlsxwriter.worksheet import Worksheet
 
 from pydantic import BaseModel, ConfigDict, Field
 import pymongo
@@ -24,6 +26,9 @@ HOUR_FRAMES = MINUTE_FRAMES * 60
 DEF_COL_NAME = "frame_data"
 
 VIMEO_GET_VIDS_URL = "https://api.vimeo.com/me/videos"
+
+THUMB_WIDTH = 96
+THUMB_HEIGHT = 74
 
 class FramePaths(BaseModel):
     baselight: Path
@@ -70,12 +75,15 @@ class VideoData(BaseModel):
 
 
 
+type RangeParts = Tuple[int, int]
+
 class FrameData(TypedDict):
-    Path: str
+    Location: str
     Frames: str
 
 class HandleFrameData(FrameData):
-    Handles: Tuple[int, int]
+    Handles: RangeParts
+    RangeParts: RangeParts
 
 
 
@@ -209,7 +217,7 @@ def get_frame_data(frame_file_path:str, relevant_paths_file_path:str):
     unique_paths = get_unique_paths(relevant_paths_file_path)
 
     data = {
-            'Path': [],
+            'Location': [],
             'Frames': [],
     }
 
@@ -231,7 +239,7 @@ def get_frame_data(frame_file_path:str, relevant_paths_file_path:str):
             ranges = frames_to_ranges(frames)
             data['Frames'].extend(ranges)
             for _ in ranges:
-                data['Path'].append(xytech_path)
+                data['Location'].append(xytech_path)
 
 
     return pandas.DataFrame.from_dict(data, orient="columns")
@@ -260,13 +268,15 @@ def get_fps(vstream: dict) -> float:
     return float(parts[0]) / float(parts[1])
 
 
-def get_range_parts(entry_frames:str) -> list[str]:
+def get_frame_range_split(entry_frames:str) -> list[str]:
     return entry_frames.split('-')
 
-def get_frames_with_handles(range_parts: list[str], handle_len: float, fps: float) -> Tuple[int, int]:
+def get_frames_with_handles(range_parts: RangeParts, handle_len: float, fps: float) -> RangeParts:
     handle_frames = handle_len * fps
-    start = max(int(range_parts[0]) - handle_frames, 0)
-    end = int(range_parts[1]) + handle_frames
+
+    start = max(range_parts[0] - handle_frames, 0)
+    end = range_parts[1] + handle_frames
+
     start = int(start)
     end = int(end)
 
@@ -276,20 +286,24 @@ def get_range_handles_below_thresh(frame_data: list[FrameData], threshold: int, 
     ranges: list[HandleFrameData] = []
     for entry in frame_data:
         entry_frames = entry['Frames']
-        range_parts = get_range_parts(entry_frames)
+        range_parts = get_frame_range_split(entry_frames)
         if len(range_parts) == 1:
             if int(range_parts[0]) >= threshold:
                 return ranges
 
             continue
 
-        if (int(range_parts[0]) >= threshold) or (int(range_parts[0]) >= threshold):
+        assert len(range_parts) >= 2, "range_parts invalid length"
+        range_parts = (int(range_parts[0]), int(range_parts[1]))
+
+        if (range_parts[0] >= threshold) or (range_parts[0] >= threshold):
             return ranges
 
         new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, fps)
         ranges.append({
             **entry,
-            'Handles': new_frames
+            'Handles': new_frames,
+            'RangeParts': range_parts
             })
 
     return ranges
@@ -341,14 +355,32 @@ def create_video_snippet(video_path: Path, out_path: Path, handles: Tuple[int, i
     print(f'Created snippet from frames {start} to {end} at {out_path}')
 
 
-def create_snippets(video_path: Path, handles: Iterable[Tuple[int, int]], fps:float):
+def create_snippets(video_path: Path, handles: Iterable[Tuple[int, int]], fps:float) -> Tuple[list[Path], Path]:
     tmp_folder_path = Path(f'tmp_{time.time()}')
     tmp_folder_path.mkdir(parents=True, exist_ok=True)
+    out_paths: list[Path] = []
 
     for handle in handles:
         start, end = handle
         out_path = tmp_folder_path / f'{video_path.stem}_{start}_{end}{video_path.suffix}'
         create_video_snippet(video_path, out_path, handle, fps)
+        out_paths.append(out_path)
+
+    return (out_paths, tmp_folder_path)
+
+def create_thumbnail(input_path: Path) -> Path:
+    # enforce png thumbnail
+    out_path = input_path.with_suffix('.thumb.png')
+
+    ffmpeg_run(
+        ffmpeg
+            .input(str(input_path), ss=0)
+            .filter('scale', THUMB_WIDTH, THUMB_HEIGHT)
+            .output(str(out_path), vframes=1)
+            .overwrite_output()
+        )
+
+    return out_path
 
 
 def init_mongodb() -> Database:
@@ -360,6 +392,63 @@ def init_mongodb() -> Database:
 def read_frame_data(col: Collection) -> list[FrameData]:
     return list(col.find({}, { '_id': 0 }))
 
+def range_parts_to_timecode_str(range_parts: RangeParts) -> str:
+    return "-".join((frames_to_timecode(range_parts[0]), frames_to_timecode(range_parts[1])))
+
+def prepare_handle_frame_data_export(handle_frame_data: list[HandleFrameData]):
+    export_records = list(map(lambda hfd: {
+        'Location': hfd['Location'],
+        'Frame Range': hfd['Frames'],
+        'Timecode Range': range_parts_to_timecode_str(hfd['RangeParts']),
+    }, handle_frame_data))
+
+    export_records = cast(list[dict[str, str]], export_records)
+    return export_records
+
+
+def get_col_widths(data: list[dict[str, str]]):
+    widths: dict[str, int] = {}
+
+    for entry in data:
+        for key, val in entry.items():
+            entry_length = len(val)
+            cur_max = widths.get(key) or 0
+            widths[key] = max(entry_length, cur_max)
+
+    return list(widths.values())
+
+
+
+def export_xlsx(handle_frame_data: list[HandleFrameData], thumb_paths: list[Path], out_path: Path):
+    export_records = prepare_handle_frame_data_export(handle_frame_data)
+    widths = get_col_widths(export_records)
+
+    df = pandas.DataFrame.from_records(export_records)
+
+    # insert text data into xlsx
+    writer = pandas.ExcelWriter(out_path, engine='xlsxwriter')
+    startrow = 0
+    df.to_excel(writer, sheet_name="Sheet1", index=False, startrow=startrow)
+
+    worksheet: Worksheet = writer.sheets["Sheet1"]
+    cols = len(df.columns)
+
+    # add images
+    worksheet.set_column(cols, cols, THUMB_WIDTH)
+    worksheet.write_string(startrow, cols, "Thumbnail")
+    for i, thumb_path in enumerate(thumb_paths):
+        worksheet.set_row(startrow + i + 1, THUMB_HEIGHT)
+        worksheet.embed_image(startrow + i + 1, cols, str(thumb_path))
+
+
+    # size columns
+    for i, width in enumerate(widths):
+        worksheet.set_column(i, i, width)
+
+
+    # save and close xlsx file
+    writer.close()
+    print(f'Exported xlsx file to {out_path}')
 
 def get_video_data(video_path: Path) -> VideoData:
     video_data = ffmpeg.probe(str(video_path))
@@ -368,18 +457,30 @@ def get_video_data(video_path: Path) -> VideoData:
     fps = get_fps(vstream)
     return VideoData(nb_frames=nb_frames, fps=fps)
 
-def process_collection(video_path: Path, col: Collection):
+def process_collection(video_path: Path, col: Collection, out_path: Path):
     frame_data = read_frame_data(col)
-    process(video_path, frame_data)
+    process(video_path, frame_data, out_path)
 
-def process(video_path: Path, frame_data: list[FrameData]):
+def process(video_path: Path, frame_data: list[FrameData], out_path: Path):
     video_data = get_video_data(video_path)
 
     # TODO: could change frame_data in place
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
-
     handles = (entry['Handles'] for entry in handle_frame_data)
-    create_snippets(video_path, handles, video_data.fps)
+
+    snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
+
+    # create thumbs and export xls
+    thumb_paths = [create_thumbnail(path) for path in snippet_paths]
+    export_xlsx(handle_frame_data, thumb_paths, out_path)
+    # export_frame_data: list[ExportFrameData] = combine_handle_frame_data_thumbnail(handle_frame_data, thumb_paths)
+    
+    
+
+    
+
+
+
 
 def pull_action(c: Pull):
     res = c.vimeo_client.get(VIMEO_GET_VIDS_URL)
@@ -400,11 +501,11 @@ def insert_only_action(c: InsertOnly):
 
 def insert_and_process_action(c: InsertAndProcess):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
-    process_collection(c.video_path, c.col)
+    process_collection(c.video_path, c.col, c.out_path)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collection(c.video_path, c.col)
+    process_collection(c.video_path, c.col, c.out_path)
 
 
 def main():
