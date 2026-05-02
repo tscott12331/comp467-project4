@@ -1,9 +1,9 @@
-import inspect
 import os
 import time
 import sys
 import re
-from typing import Annotated, Iterable, Literal, Tuple, TypedDict, Union, cast
+from typing import Annotated, Any, Iterable, Literal, Tuple, TypedDict, Union, cast
+from typing_extensions import Doc
 import pandas
 from xlsxwriter.worksheet import Worksheet
 
@@ -382,6 +382,68 @@ def create_thumbnail(input_path: Path) -> Path:
 
     return out_path
 
+class AddTextOpts(BaseModel):
+    ffmpeg_input: Any
+    text: str 
+    fontsize: str|int
+    fontcolor: str
+    x: str|int
+    y: str|int
+    box: Annotated[Literal[0, 1], Doc("0 - no box\n1 - box")] = 0
+    borderw: str|int|None=None
+    boxcolor: str|None=None
+
+def add_text(opts: AddTextOpts):
+    with_text = (
+        opts.ffmpeg_input
+            .drawtext(
+                **opts.model_dump(exclude={'ffmpeg_input'}, exclude_none=True)
+            )
+    )
+
+    return with_text
+
+
+def add_watermark(input_path: Path, out_path: Path) -> Path:
+    text = out_path.name
+    box_border_width = 5
+
+    # enforce same out file type
+    if input_path.suffix != out_path.suffix:
+        raise Exception(f"Adding a watermark expects output file '{out_path.name}' to have same extension as the input '{input_path.name}'")
+    
+    ffmpeg_input = ffmpeg.input(str(input_path))
+
+    video_input = ffmpeg_input.video
+    audio_input = ffmpeg_input.audio
+
+    watermark_opts = AddTextOpts(ffmpeg_input=video_input,
+                text=text,
+                fontsize=f'w/{len(text)}',
+                fontcolor="white",
+                x="w-text_w",
+                y=box_border_width
+                )
+    watermarked_video = add_text(watermark_opts)
+
+    ffmpeg_run(
+            ffmpeg
+                .output(watermarked_video, audio_input, str(out_path))
+                .overwrite_output()
+            )
+
+    return out_path
+
+
+def upload(input_path: Path):
+    print(f"Uploaded {input_path}")
+
+
+def watermark_and_upload(video_paths: list[Path]):
+    for path in video_paths:
+        watermark_path = path.with_stem(f'{path.stem}_watermarked')
+        add_watermark(path, watermark_path)
+        upload(watermark_path)
 
 def init_mongodb() -> Database:
     myclient = pymongo.MongoClient("mongodb://localhost:27017")
@@ -475,7 +537,7 @@ def process(video_path: Path, frame_data: list[FrameData], out_path: Path):
     export_xlsx(handle_frame_data, thumb_paths, out_path)
     # export_frame_data: list[ExportFrameData] = combine_handle_frame_data_thumbnail(handle_frame_data, thumb_paths)
     
-    
+    watermark_and_upload(snippet_paths)
 
     
 
