@@ -11,7 +11,6 @@ from pydantic import BaseModel, ConfigDict, Field
 import pymongo
 from pymongo.synchronous.collection import Collection
 from pymongo.synchronous.database import Database
-from pymongo.typings import _Pipeline
 from pathlib import Path
 from dotenv import load_dotenv
 from vimeo import VimeoClient
@@ -51,6 +50,7 @@ class InsertAndProcess(BaseModel):
     col: Collection
     video_path: Path
     out_path: Path
+    vimeo_client: VimeoClient
 
 class ReadAndProcess(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -59,6 +59,7 @@ class ReadAndProcess(BaseModel):
     col: Collection
     video_path: Path
     out_path: Path
+    vimeo_client: VimeoClient
 
 class Pull(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -134,13 +135,13 @@ def get_config(args: argparse.Namespace) -> Config:
     out_path_str = args.out
     pull = args.pull
 
+    client_id, client_secret, access_token = get_vimeo_credentials()
+    vimeo_client = VimeoClient(key=client_id, token=access_token, secret=client_secret)
+
     if video_path_str is None:
         if pull:
             assert out_path_str is not None, "pulling vimeo video data requires output path"
             out_path = Path(out_path_str)
-
-            client_id, client_secret, access_token = get_vimeo_credentials()
-            vimeo_client = VimeoClient(key=client_id, token=access_token, secret=client_secret)
 
             return Pull(config_type='pull', out_path=out_path, vimeo_client=vimeo_client)
 
@@ -151,9 +152,9 @@ def get_config(args: argparse.Namespace) -> Config:
         video_path = Path(video_path_str)
         out_path = Path(out_path_str)
         if frame_paths is None:
-            return ReadAndProcess(config_type='read_and_process', col=col, video_path=video_path, out_path=out_path)
+            return ReadAndProcess(config_type='read_and_process', col=col, video_path=video_path, out_path=out_path, vimeo_client=vimeo_client)
         else:
-            return InsertAndProcess(config_type='insert_and_process', frame_paths=frame_paths, col=col, video_path=video_path, out_path=out_path)
+            return InsertAndProcess(config_type='insert_and_process', frame_paths=frame_paths, col=col, video_path=video_path, out_path=out_path, vimeo_client=vimeo_client)
         
 
 
@@ -435,15 +436,19 @@ def add_watermark(input_path: Path, out_path: Path) -> Path:
     return out_path
 
 
-def upload(input_path: Path):
-    print(f"Uploaded {input_path}")
+def upload(video_path: Path, vimeo_client: VimeoClient):
+    uri = vimeo_client.upload(str(video_path), data={
+        'name': video_path.name,
+    })
+
+    print(f"Started uploading {video_path} to {uri}")
 
 
-def watermark_and_upload(video_paths: list[Path]):
+def watermark_and_upload(vimeo_client: VimeoClient, video_paths: list[Path]):
     for path in video_paths:
         watermark_path = path.with_stem(f'{path.stem}_watermarked')
         add_watermark(path, watermark_path)
-        upload(watermark_path)
+        upload(watermark_path, vimeo_client)
 
 def init_mongodb() -> Database:
     myclient = pymongo.MongoClient("mongodb://localhost:27017")
@@ -519,11 +524,11 @@ def get_video_data(video_path: Path) -> VideoData:
     fps = get_fps(vstream)
     return VideoData(nb_frames=nb_frames, fps=fps)
 
-def process_collection(video_path: Path, col: Collection, out_path: Path):
+def process_collection(video_path: Path, col: Collection, out_path: Path, vimeo_client: VimeoClient):
     frame_data = read_frame_data(col)
-    process(video_path, frame_data, out_path)
+    process(video_path, frame_data, out_path, vimeo_client)
 
-def process(video_path: Path, frame_data: list[FrameData], out_path: Path):
+def process(video_path: Path, frame_data: list[FrameData], out_path: Path, vimeo_client: VimeoClient):
     video_data = get_video_data(video_path)
 
     # TODO: could change frame_data in place
@@ -537,7 +542,7 @@ def process(video_path: Path, frame_data: list[FrameData], out_path: Path):
     export_xlsx(handle_frame_data, thumb_paths, out_path)
     # export_frame_data: list[ExportFrameData] = combine_handle_frame_data_thumbnail(handle_frame_data, thumb_paths)
     
-    watermark_and_upload(snippet_paths)
+    watermark_and_upload(vimeo_client, snippet_paths)
 
     
 
@@ -563,11 +568,11 @@ def insert_only_action(c: InsertOnly):
 
 def insert_and_process_action(c: InsertAndProcess):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
-    process_collection(c.video_path, c.col, c.out_path)
+    process_collection(c.video_path, c.col, c.out_path, c.vimeo_client)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collection(c.video_path, c.col, c.out_path)
+    process_collection(c.video_path, c.col, c.out_path, c.vimeo_client)
 
 
 def main():
