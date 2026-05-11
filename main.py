@@ -272,11 +272,11 @@ def get_fps(vstream: dict) -> float:
 def get_frame_range_split(entry_frames:str) -> list[str]:
     return entry_frames.split('-')
 
-def get_frames_with_handles(range_parts: RangeParts, handle_len: float, fps: float) -> RangeParts:
+def get_frames_with_handles(range_parts: RangeParts, handle_len: float, max_frames: int, fps: float) -> RangeParts:
     handle_frames = handle_len * fps
 
     start = max(range_parts[0] - handle_frames, 0)
-    end = range_parts[1] + handle_frames
+    end = min(range_parts[1] + handle_frames, max_frames)
 
     start = int(start)
     end = int(end)
@@ -300,7 +300,7 @@ def get_range_handles_below_thresh(frame_data: list[FrameData], threshold: int, 
         if (range_parts[0] >= threshold) or (range_parts[0] >= threshold):
             return ranges
 
-        new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, fps)
+        new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, threshold, fps)
         ranges.append({
             **entry,
             'Handles': new_frames,
@@ -309,8 +309,6 @@ def get_range_handles_below_thresh(frame_data: list[FrameData], threshold: int, 
 
     return ranges
 
-# unsure if this timecode would work with ffmpeg
-# pretty sure he wants this for output tho
 def frames_to_timecode(frames: int):
     hours = frames // HOUR_FRAMES
     frames = frames % HOUR_FRAMES
@@ -353,7 +351,7 @@ def create_video_snippet(video_path: Path, out_path: Path, handles: Tuple[int, i
         )
 
     ffmpeg_run(sequence)
-    print(f'Created snippet from frames {start} to {end} at {out_path}')
+    print(f'Created snippet of {video_path} from frames {start} to {end}')
 
 
 def create_snippets(video_path: Path, handles: Iterable[Tuple[int, int]], fps:float) -> Tuple[list[Path], Path]:
@@ -381,6 +379,7 @@ def create_thumbnail(input_path: Path) -> Path:
             .overwrite_output()
         )
 
+    print(f"Created thumbnail for {input_path}")
     return out_path
 
 class AddTextOpts(BaseModel):
@@ -420,8 +419,8 @@ def add_watermark(input_path: Path, out_path: Path) -> Path:
 
     watermark_opts = AddTextOpts(ffmpeg_input=video_input,
                 text=text,
-                fontsize=f'w/{len(text)}',
-                fontcolor="white",
+                fontsize=f'w/{len(text)/1.25}',
+                fontcolor="OrangeRed",
                 x="w-text_w",
                 y=box_border_width
                 )
@@ -432,6 +431,8 @@ def add_watermark(input_path: Path, out_path: Path) -> Path:
                 .output(watermarked_video, audio_input, str(out_path))
                 .overwrite_output()
             )
+    
+    print(f"Watermarked {input_path}")
 
     return out_path
 
@@ -524,6 +525,17 @@ def get_video_data(video_path: Path) -> VideoData:
     fps = get_fps(vstream)
     return VideoData(nb_frames=nb_frames, fps=fps)
 
+
+def rm_path(path: Path):
+    if path.is_dir():
+        for sub_path in path.iterdir():
+            rm_path(sub_path)
+
+        path.rmdir()
+    else:
+        path.unlink(missing_ok=True)
+
+
 def process_collection(video_path: Path, col: Collection, out_path: Path, vimeo_client: VimeoClient):
     frame_data = read_frame_data(col)
     process(video_path, frame_data, out_path, vimeo_client)
@@ -531,7 +543,6 @@ def process_collection(video_path: Path, col: Collection, out_path: Path, vimeo_
 def process(video_path: Path, frame_data: list[FrameData], out_path: Path, vimeo_client: VimeoClient):
     video_data = get_video_data(video_path)
 
-    # TODO: could change frame_data in place
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
     handles = (entry['Handles'] for entry in handle_frame_data)
 
@@ -540,9 +551,11 @@ def process(video_path: Path, frame_data: list[FrameData], out_path: Path, vimeo
     # create thumbs and export xls
     thumb_paths = [create_thumbnail(path) for path in snippet_paths]
     export_xlsx(handle_frame_data, thumb_paths, out_path)
-    # export_frame_data: list[ExportFrameData] = combine_handle_frame_data_thumbnail(handle_frame_data, thumb_paths)
     
     watermark_and_upload(vimeo_client, snippet_paths)
+
+    rm_path(tmp_folder_path)
+    print("Cleaned up processed files")
 
     
 
@@ -562,7 +575,8 @@ def pull_action(c: Pull):
 
     df = pandas.DataFrame.from_records(videos)
 
-    df.to_csv(c.out_path)
+    df.to_csv(c.out_path, index=False)
+    print(f'Saved vimeo video data to {c.out_path}')
 def insert_only_action(c: InsertOnly):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
 
