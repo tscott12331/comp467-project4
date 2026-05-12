@@ -22,7 +22,8 @@ SECOND_FRAMES = 24
 MINUTE_FRAMES = SECOND_FRAMES * 60
 HOUR_FRAMES = MINUTE_FRAMES * 60
 
-DEF_COL_NAME = "frame_data"
+DEF_FRAME_COL_NAME = "frame_data"
+DEF_WORKORDER_COL_NAME = "workorder_data"
 
 VIMEO_GET_VIDS_URL = "https://api.vimeo.com/me/videos"
 
@@ -40,14 +41,16 @@ class InsertOnly(BaseModel):
 
     config_type: Literal['insert_only']
     frame_paths: FramePaths
-    col: Collection
+    frame_col: Collection
+    workorder_col: Collection
 
 class InsertAndProcess(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     config_type: Literal['insert_and_process']
     frame_paths: FramePaths
-    col: Collection
+    frame_col: Collection
+    workorder_col: Collection
     video_path: Path
     should_watermark: bool
     out_path: Path
@@ -57,7 +60,8 @@ class ReadAndProcess(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     config_type: Literal['read_and_process']
-    col: Collection
+    frame_col: Collection
+    workorder_col: Collection
     video_path: Path
     should_watermark: bool
     out_path: Path
@@ -80,15 +84,31 @@ class VideoData(BaseModel):
 
 type RangeParts = Tuple[int, int]
 
-class FrameData(TypedDict):
+class WorkorderData(TypedDict):
+    Workorder: str
+    Producer: str
+    Operator: str
+    Job: str
+
+class XytechData(TypedDict):
+    WorkorderData: WorkorderData
+    UniquePaths: dict[str, str]
+
+class FrameEntry(TypedDict):
     Location: str
     Frames: str
 
-class HandleFrameData(FrameData):
+class HandleFrameEntry(FrameEntry):
     Handles: RangeParts
     RangeParts: RangeParts
 
+type FrameData = list[FrameEntry]
 
+class CollectionData(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    frame_dataframe: pandas.DataFrame
+    workorder_dataframe: pandas.DataFrame
 
 
 def conf_argparse() -> argparse.Namespace:
@@ -97,7 +117,8 @@ def conf_argparse() -> argparse.Namespace:
     parser.add_argument('-b', '--baselight', help="path to baselight file")
     parser.add_argument('-x', '--xytech', help="path to xytech file")
 
-    parser.add_argument('-c', '--collection', help="mongodb collection to store/retrieve data", default="frame_data")
+    parser.add_argument('-f', '--frame_col', help="mongodb collection to store/retrieve frame data", default=DEF_FRAME_COL_NAME)
+    parser.add_argument('-W', '--workorder_col', help="mongodb collection to store/retrieve xytech workorder data", default=DEF_WORKORDER_COL_NAME)
     
     parser.add_argument('-w', '--watermark', help="watermark snippets before upload", action="store_true")
 
@@ -121,9 +142,11 @@ def get_vimeo_credentials():
 
 
 def get_config(args: argparse.Namespace) -> Config:
-    col_name = args.collection or DEF_COL_NAME
+    frame_col_name = args.frame_col or DEF_FRAME_COL_NAME
+    workorder_col_name = args.workorder_col or DEF_WORKORDER_COL_NAME
     db = init_mongodb()
-    col = db[col_name]
+    frame_col = db[frame_col_name]
+    workorder_col = db[workorder_col_name]
 
     baselight = args.baselight
     xytech = args.xytech
@@ -151,14 +174,15 @@ def get_config(args: argparse.Namespace) -> Config:
             return Pull(config_type='pull', out_path=out_path, vimeo_client=vimeo_client)
 
         assert frame_paths is not None, "if not processing video, specify baselight and xytech file to insert"
-        return InsertOnly(config_type='insert_only', frame_paths=frame_paths, col=col)
+        return InsertOnly(config_type='insert_only', frame_paths=frame_paths, frame_col=frame_col, workorder_col=workorder_col)
     else:
         assert out_path_str is not None, "processing video requires output path"
         video_path = Path(video_path_str)
         out_path = Path(out_path_str)
         if frame_paths is None:
             return ReadAndProcess(config_type='read_and_process', 
-                                  col=col, 
+                                  frame_col=frame_col, 
+                                  workorder_col=workorder_col,
                                   video_path=video_path, 
                                   out_path=out_path, 
                                   should_watermark=should_watermark, 
@@ -166,7 +190,8 @@ def get_config(args: argparse.Namespace) -> Config:
         else:
             return InsertAndProcess(config_type='insert_and_process', 
                                     frame_paths=frame_paths, 
-                                    col=col, 
+                                    frame_col=frame_col, 
+                                    workorder_col=workorder_col,
                                     video_path=video_path, 
                                     out_path=out_path, 
                                     should_watermark=should_watermark, 
@@ -175,18 +200,27 @@ def get_config(args: argparse.Namespace) -> Config:
 
 
 
-def insert_frame_data(col: Collection, df: pandas.DataFrame) -> Collection:
+def insert_dataframe(col: Collection, df: pandas.DataFrame) -> Collection:
     col.delete_many({})
     col.insert_many(df.to_dict(orient='records'))
 
     return col
 
-def insert_frame_files(baselight_path: Path, xytech_path: Path, col: Collection):
-    df = get_frame_data(str(baselight_path), str(xytech_path))
-    insert_frame_data(col, df)
+def insert_frame_files(baselight_path: Path, xytech_path: Path, frame_col: Collection, workorder_col: Collection):
+    collection_data = process_frame_files(str(baselight_path), str(xytech_path))
+    insert_dataframe(frame_col, collection_data.frame_dataframe)
+    insert_dataframe(workorder_col, collection_data.workorder_dataframe)
 
 # match path after prefix for xytech file paths
 xytech_path_re = r'(/hpsans\d{2}/production/)([A-Za-z0-9/\-_]+)'
+xytech_workorder_re = r'Xytech Workorder (\d+)'
+xytech_data_re = r'(\w+): (.+)'
+xytech_re = rf'{xytech_workorder_re}|{xytech_data_re}|{xytech_path_re}'
+X_WORKORDER_GROUP = 0
+X_DATA_NAME_GROUP = 1
+X_DATA_ENTRY_GROUP = 2
+X_PATH_PREFIX_GROUP = 3
+X_PATH_SUFFIX_GROUP = 4
 baselight_prefix = '/baselightfilesystem1/'
 
 # matches the path after baselight file prefix AND the frame numbers into groups
@@ -216,24 +250,38 @@ def frames_to_ranges(frames:list[str]) -> list[str]:
 
         return out
 
-def get_unique_paths(file_name:str) -> dict[str, str]:
+def process_xytech(file_name:str) -> XytechData:
     unique_paths: dict[str,str] = {}
+    workorder_data: WorkorderData = {
+                'Job': '',
+                'Operator': '',
+                'Producer': '',
+                'Workorder': ''
+            }
     with open(file_name) as file:
         for line in file.readlines():
-            path_match = re.search(xytech_path_re, line)
-            if path_match is None:
+            xytech_match = re.search(xytech_re, line)
+            if xytech_match is None:
                 continue
 
-            prefix = path_match.group(1)
-            suffix = path_match.group(2)
-            unique_paths[suffix] = prefix
+            groups = xytech_match.groups()
+            if groups[X_WORKORDER_GROUP] is not None:
+                workorder_data['Workorder'] = groups[X_WORKORDER_GROUP]
+            elif groups[X_DATA_NAME_GROUP] is not None and groups[X_DATA_ENTRY_GROUP] is not None:
+                workorder_data[groups[X_DATA_NAME_GROUP]] = groups[X_DATA_ENTRY_GROUP]
+            elif groups[X_PATH_PREFIX_GROUP] is not None and groups[X_PATH_SUFFIX_GROUP] is not None:
+                unique_paths[groups[X_PATH_SUFFIX_GROUP]] = groups[X_PATH_PREFIX_GROUP]
 
-    return unique_paths
+    return {
+            'UniquePaths': unique_paths,
+            'WorkorderData': workorder_data
+            }
 
-def get_frame_data(frame_file_path:str, relevant_paths_file_path:str):
-    unique_paths = get_unique_paths(relevant_paths_file_path)
+def process_frame_files(frame_file_path:str, relevant_paths_file_path:str) -> CollectionData:
+    xytech_data = process_xytech(relevant_paths_file_path)
+    unique_paths = xytech_data['UniquePaths']
 
-    data = {
+    frame_data = {
             'Location': [],
             'Frames': [],
     }
@@ -254,12 +302,14 @@ def get_frame_data(frame_file_path:str, relevant_paths_file_path:str):
             frames = re.split(r'\s+', path_match.group(2).strip())
             xytech_path = f"{path_prefix}{path_suffix}"
             ranges = frames_to_ranges(frames)
-            data['Frames'].extend(ranges)
+            frame_data['Frames'].extend(ranges)
             for _ in ranges:
-                data['Location'].append(xytech_path)
+                frame_data['Location'].append(xytech_path)
 
 
-    return pandas.DataFrame.from_dict(data, orient="columns")
+    frame_dataframe = pandas.DataFrame.from_dict(frame_data, orient="columns")
+    workorder_dataframe = pandas.DataFrame.from_records(xytech_data['WorkorderData'], index=[0])
+    return CollectionData(frame_dataframe=frame_dataframe, workorder_dataframe=workorder_dataframe)
 
 def get_video_stream(video_data: dict) -> dict:
     vstream = next((stream for stream in video_data['streams'] if stream['codec_type'] == 'video'), None)
@@ -299,8 +349,8 @@ def get_frames_with_handles(range_parts: RangeParts, handle_len: float, max_fram
 
     return (start, end)
 
-def get_range_handles_below_thresh(frame_data: list[FrameData], threshold: int, fps: float) -> list[HandleFrameData]:
-    ranges: list[HandleFrameData] = []
+def get_range_handles_below_thresh(frame_data: list[FrameEntry], threshold: int, fps: float) -> list[HandleFrameEntry]:
+    ranges: list[HandleFrameEntry] = []
     for entry in frame_data:
         entry_frames = entry['Frames']
         range_parts = get_frame_range_split(entry_frames)
@@ -481,13 +531,13 @@ def init_mongodb() -> Database:
 
     return db
 
-def read_frame_data(col: Collection) -> list[FrameData]:
+def read_frame_data(col: Collection) -> list[FrameEntry]:
     return list(col.find({}, { '_id': 0 }))
 
 def range_parts_to_timecode_str(range_parts: RangeParts) -> str:
     return "-".join((frames_to_timecode(range_parts[0]), frames_to_timecode(range_parts[1])))
 
-def prepare_handle_frame_data_export(handle_frame_data: list[HandleFrameData]):
+def prepare_handle_frame_data_export(handle_frame_data: list[HandleFrameEntry]):
     export_records = list(map(lambda hfd: {
         'Location': hfd['Location'],
         'Frame Range': hfd['Frames'],
@@ -511,7 +561,7 @@ def get_col_widths(data: list[dict[str, str]]):
 
 
 
-def export_xlsx(handle_frame_data: list[HandleFrameData], thumb_paths: list[Path], out_path: Path):
+def export_xlsx(handle_frame_data: list[HandleFrameEntry], thumb_paths: list[Path], out_path: Path):
     export_records = prepare_handle_frame_data_export(handle_frame_data)
     widths = get_col_widths(export_records)
 
@@ -564,25 +614,25 @@ def process_collection(video_path: Path, col: Collection, out_path: Path, should
     frame_data = read_frame_data(col)
     process(video_path, frame_data, out_path, should_watermark, vimeo_client)
 
-def process(video_path: Path, frame_data: list[FrameData], out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
+def process(video_path: Path, frame_data: list[FrameEntry], out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
     video_data = get_video_data(video_path)
 
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
     handles = (entry['Handles'] for entry in handle_frame_data)
 
-    snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
+    # snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
+    #
+    # # create thumbs and export xls
+    # thumb_paths = [create_thumbnail(path) for path in snippet_paths]
+    # export_xlsx(handle_frame_data, thumb_paths, out_path)
+    #
+    # if should_watermark:
+    #     snippet_paths = watermark_snippets(snippet_paths)
+    #
+    # upload_snippets(vimeo_client, snippet_paths)
 
-    # create thumbs and export xls
-    thumb_paths = [create_thumbnail(path) for path in snippet_paths]
-    export_xlsx(handle_frame_data, thumb_paths, out_path)
-    
-    if should_watermark:
-        snippet_paths = watermark_snippets(snippet_paths)
-
-    upload_snippets(vimeo_client, snippet_paths)
-
-    rm_path(tmp_folder_path)
-    print("Cleaned up processed files")
+    # rm_path(tmp_folder_path)
+    # print("Cleaned up processed files")
 
     
 
@@ -605,15 +655,15 @@ def pull_action(c: Pull):
     df.to_csv(c.out_path, index=False)
     print(f'Saved vimeo video data to {c.out_path}')
 def insert_only_action(c: InsertOnly):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
 
 def insert_and_process_action(c: InsertAndProcess):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.col)
-    process_collection(c.video_path, c.col, c.out_path, c.should_watermark, c.vimeo_client)
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
+    process_collection(c.video_path, c.frame_col, c.out_path, c.should_watermark, c.vimeo_client)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collection(c.video_path, c.col, c.out_path, c.should_watermark, c.vimeo_client)
+    process_collection(c.video_path, c.frame_col, c.out_path, c.should_watermark, c.vimeo_client)
 
 
 def main():
