@@ -102,7 +102,17 @@ class HandleFrameEntry(FrameEntry):
     Handles: RangeParts
     RangeParts: RangeParts
 
-type FrameData = list[FrameEntry]
+class FrameData(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    workorder_data: WorkorderData
+    frame_entries: list[FrameEntry]
+
+class HandleFrameData(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    workorder_data: WorkorderData
+    frame_entries: list[HandleFrameEntry]
 
 class CollectionData(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -349,14 +359,15 @@ def get_frames_with_handles(range_parts: RangeParts, handle_len: float, max_fram
 
     return (start, end)
 
-def get_range_handles_below_thresh(frame_data: list[FrameEntry], threshold: int, fps: float) -> list[HandleFrameEntry]:
-    ranges: list[HandleFrameEntry] = []
-    for entry in frame_data:
+def get_range_handles_below_thresh(frame_data: FrameData, threshold: int, fps: float) -> HandleFrameData:
+    handle_frame_data = HandleFrameData(workorder_data=frame_data.workorder_data, frame_entries=[])
+
+    for entry in frame_data.frame_entries:
         entry_frames = entry['Frames']
         range_parts = get_frame_range_split(entry_frames)
         if len(range_parts) == 1:
             if int(range_parts[0]) >= threshold:
-                return ranges
+                return handle_frame_data
 
             continue
 
@@ -364,16 +375,16 @@ def get_range_handles_below_thresh(frame_data: list[FrameEntry], threshold: int,
         range_parts = (int(range_parts[0]), int(range_parts[1]))
 
         if (range_parts[0] >= threshold) or (range_parts[0] >= threshold):
-            return ranges
+            return handle_frame_data
 
         new_frames = get_frames_with_handles(range_parts, HANDLE_LEN, threshold, fps)
-        ranges.append({
+        handle_frame_data.frame_entries.append({
             **entry,
             'Handles': new_frames,
             'RangeParts': range_parts
             })
 
-    return ranges
+    return handle_frame_data
 
 def frames_to_timecode(frames: int):
     hours = frames // HOUR_FRAMES
@@ -531,8 +542,11 @@ def init_mongodb() -> Database:
 
     return db
 
-def read_frame_data(col: Collection) -> list[FrameEntry]:
-    return list(col.find({}, { '_id': 0 }))
+def read_frame_data(frame_col: Collection, workorder_col: Collection) -> FrameData:
+    frame_entries = list(frame_col.find({}, { '_id': 0 }))
+    workorder_data = workorder_col.find({}, { '_id': 0}).next()
+
+    return FrameData(workorder_data=workorder_data, frame_entries=frame_entries)
 
 def range_parts_to_timecode_str(range_parts: RangeParts) -> str:
     return "-".join((frames_to_timecode(range_parts[0]), frames_to_timecode(range_parts[1])))
@@ -561,19 +575,29 @@ def get_col_widths(data: list[dict[str, str]]):
 
 
 
-def export_xlsx(handle_frame_data: list[HandleFrameEntry], thumb_paths: list[Path], out_path: Path):
-    export_records = prepare_handle_frame_data_export(handle_frame_data)
+def export_xlsx(handle_frame_data: HandleFrameData, thumb_paths: list[Path], out_path: Path):
+    export_records = prepare_handle_frame_data_export(handle_frame_data.frame_entries)
     widths = get_col_widths(export_records)
 
-    df = pandas.DataFrame.from_records(export_records)
+    frame_df = pandas.DataFrame.from_records(export_records)
+    workorder_df = pandas.DataFrame.from_records(handle_frame_data.workorder_data, index=[0], 
+                                                 columns=['Workorder', 'Producer', 'Operator', 'Job'])
 
     # insert text data into xlsx
     writer = pandas.ExcelWriter(out_path, engine='xlsxwriter')
+
     startrow = 0
-    df.to_excel(writer, sheet_name="Sheet1", index=False, startrow=startrow)
+    sheet_name = "Sheet1"
+
+    workorder_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
+    
+    # workorder title + row + space
+    startrow += 3
+
+    frame_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
 
     worksheet: Worksheet = writer.sheets["Sheet1"]
-    cols = len(df.columns)
+    cols = len(frame_df.columns)
 
     # add images
     worksheet.set_column(cols, cols, THUMB_WIDTH)
@@ -610,29 +634,29 @@ def rm_path(path: Path):
         path.unlink(missing_ok=True)
 
 
-def process_collection(video_path: Path, col: Collection, out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
-    frame_data = read_frame_data(col)
+def process_collections(video_path: Path, frame_col: Collection, workorder_col: Collection, out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
+    frame_data = read_frame_data(frame_col, workorder_col)
     process(video_path, frame_data, out_path, should_watermark, vimeo_client)
 
-def process(video_path: Path, frame_data: list[FrameEntry], out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
+def process(video_path: Path, frame_data: FrameData, out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
     video_data = get_video_data(video_path)
 
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
-    handles = (entry['Handles'] for entry in handle_frame_data)
+    handles = (entry['Handles'] for entry in handle_frame_data.frame_entries)
 
-    # snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
-    #
-    # # create thumbs and export xls
-    # thumb_paths = [create_thumbnail(path) for path in snippet_paths]
-    # export_xlsx(handle_frame_data, thumb_paths, out_path)
-    #
-    # if should_watermark:
-    #     snippet_paths = watermark_snippets(snippet_paths)
-    #
-    # upload_snippets(vimeo_client, snippet_paths)
+    snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
 
-    # rm_path(tmp_folder_path)
-    # print("Cleaned up processed files")
+    # create thumbs and export xls
+    thumb_paths = [create_thumbnail(path) for path in snippet_paths]
+    export_xlsx(handle_frame_data, thumb_paths, out_path)
+
+    if should_watermark:
+        snippet_paths = watermark_snippets(snippet_paths)
+
+    upload_snippets(vimeo_client, snippet_paths)
+
+    rm_path(tmp_folder_path)
+    print("Cleaned up processed files")
 
     
 
@@ -659,11 +683,11 @@ def insert_only_action(c: InsertOnly):
 
 def insert_and_process_action(c: InsertAndProcess):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
-    process_collection(c.video_path, c.frame_col, c.out_path, c.should_watermark, c.vimeo_client)
+    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.vimeo_client)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collection(c.video_path, c.frame_col, c.out_path, c.should_watermark, c.vimeo_client)
+    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.vimeo_client)
 
 
 def main():
