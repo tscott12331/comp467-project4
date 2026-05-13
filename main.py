@@ -34,6 +34,21 @@ class FramePaths(BaseModel):
     baselight: Path
     xytech: Path
 
+class MongoCollections(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    frame_col: Collection
+    workorder_col: Collection
+
+class ProcessData(BaseModel):
+    model_config = ConfigDict(arbitrary_types_allowed=True)
+
+    collections: MongoCollections
+    video_path: Path
+    should_watermark: bool
+    add_workorder: bool
+    out_path: Path
+    vimeo_client: VimeoClient
 
 # arbitrary type config needed for pymongo Collection type
 class InsertOnly(BaseModel):
@@ -41,33 +56,20 @@ class InsertOnly(BaseModel):
 
     config_type: Literal['insert_only']
     frame_paths: FramePaths
-    frame_col: Collection
-    workorder_col: Collection
+    collections: MongoCollections
 
 class InsertAndProcess(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     config_type: Literal['insert_and_process']
     frame_paths: FramePaths
-    frame_col: Collection
-    workorder_col: Collection
-    video_path: Path
-    should_watermark: bool
-    add_workorder: bool
-    out_path: Path
-    vimeo_client: VimeoClient
+    process_data: ProcessData
 
 class ReadAndProcess(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
 
     config_type: Literal['read_and_process']
-    frame_col: Collection
-    workorder_col: Collection
-    video_path: Path
-    should_watermark: bool
-    add_workorder: bool
-    out_path: Path
-    vimeo_client: VimeoClient
+    process_data: ProcessData
 
 class Pull(BaseModel):
     model_config = ConfigDict(arbitrary_types_allowed=True)
@@ -160,6 +162,7 @@ def get_config(args: argparse.Namespace) -> Config:
     db = init_mongodb()
     frame_col = db[frame_col_name]
     workorder_col = db[workorder_col_name]
+    collections = MongoCollections(frame_col=frame_col, workorder_col=workorder_col)
 
     baselight = args.baselight
     xytech = args.xytech
@@ -188,30 +191,23 @@ def get_config(args: argparse.Namespace) -> Config:
             return Pull(config_type='pull', out_path=out_path, vimeo_client=vimeo_client)
 
         assert frame_paths is not None, "if not processing video, specify baselight and xytech file to insert"
-        return InsertOnly(config_type='insert_only', frame_paths=frame_paths, frame_col=frame_col, workorder_col=workorder_col)
+        return InsertOnly(config_type='insert_only', frame_paths=frame_paths, collections=collections)
     else:
         assert out_path_str is not None, "processing video requires output path"
         video_path = Path(video_path_str)
         out_path = Path(out_path_str)
+        process_data = ProcessData(
+                        collections=collections,
+                        video_path=video_path, 
+                        add_workorder=add_workorder,
+                        out_path=out_path, 
+                        should_watermark=should_watermark, 
+                        vimeo_client=vimeo_client)
+
         if frame_paths is None:
-            return ReadAndProcess(config_type='read_and_process', 
-                                  frame_col=frame_col, 
-                                  workorder_col=workorder_col,
-                                  video_path=video_path, 
-                                  add_workorder=add_workorder,
-                                  out_path=out_path, 
-                                  should_watermark=should_watermark, 
-                                  vimeo_client=vimeo_client)
+            return ReadAndProcess(config_type='read_and_process', process_data=process_data)
         else:
-            return InsertAndProcess(config_type='insert_and_process', 
-                                    frame_paths=frame_paths, 
-                                    frame_col=frame_col, 
-                                    workorder_col=workorder_col,
-                                    video_path=video_path, 
-                                    add_workorder=add_workorder,
-                                    out_path=out_path, 
-                                    should_watermark=should_watermark, 
-                                    vimeo_client=vimeo_client)
+            return InsertAndProcess(config_type='insert_and_process', frame_paths=frame_paths, process_data=process_data)
         
 
 
@@ -222,10 +218,10 @@ def insert_dataframe(col: Collection, df: pandas.DataFrame) -> Collection:
 
     return col
 
-def insert_frame_files(baselight_path: Path, xytech_path: Path, frame_col: Collection, workorder_col: Collection):
+def insert_frame_files(baselight_path: Path, xytech_path: Path, collections: MongoCollections):
     collection_data = process_frame_files(str(baselight_path), str(xytech_path))
-    insert_dataframe(frame_col, collection_data.frame_dataframe)
-    insert_dataframe(workorder_col, collection_data.workorder_dataframe)
+    insert_dataframe(collections.frame_col, collection_data.frame_dataframe)
+    insert_dataframe(collections.workorder_col, collection_data.workorder_dataframe)
 
 # match path after prefix for xytech file paths
 xytech_path_re = r'(/hpsans\d{2}/production/)([A-Za-z0-9/\-_]+)'
@@ -548,9 +544,9 @@ def init_mongodb() -> Database:
 
     return db
 
-def read_frame_data(frame_col: Collection, workorder_col: Collection) -> FrameData:
-    frame_entries = list(frame_col.find({}, { '_id': 0 }))
-    workorder_data = workorder_col.find({}, { '_id': 0}).next()
+def read_frame_data(collections: MongoCollections) -> FrameData:
+    frame_entries = list(collections.frame_col.find({}, { '_id': 0 }))
+    workorder_data = collections.workorder_col.find({}, { '_id': 0}).next()
 
     return FrameData(workorder_data=workorder_data, frame_entries=frame_entries)
 
@@ -640,26 +636,26 @@ def rm_path(path: Path):
         path.unlink(missing_ok=True)
 
 
-def process_collections(video_path: Path, frame_col: Collection, workorder_col: Collection, out_path: Path, should_watermark: bool, add_workorder: bool, vimeo_client: VimeoClient):
-    frame_data = read_frame_data(frame_col, workorder_col)
-    process(video_path, frame_data, out_path, should_watermark, add_workorder, vimeo_client)
+def process_collections(process_data: ProcessData):
+    frame_data = read_frame_data(process_data.collections)
+    process(process_data, frame_data)
 
-def process(video_path: Path, frame_data: FrameData, out_path: Path, should_watermark: bool, add_workorder: bool, vimeo_client: VimeoClient):
-    video_data = get_video_data(video_path)
+def process(process_data: ProcessData, frame_data: FrameData):
+    video_data = get_video_data(process_data.video_path)
 
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
     handles = (entry['Handles'] for entry in handle_frame_data.frame_entries)
 
-    snippet_paths, tmp_folder_path = create_snippets(video_path, handles, video_data.fps)
+    snippet_paths, tmp_folder_path = create_snippets(process_data.video_path, handles, video_data.fps)
 
     # create thumbs and export xls
     thumb_paths = [create_thumbnail(path) for path in snippet_paths]
-    export_xlsx(handle_frame_data, thumb_paths, out_path, add_workorder)
+    export_xlsx(handle_frame_data, thumb_paths, process_data.out_path, process_data.add_workorder)
 
-    if should_watermark:
+    if process_data.should_watermark:
         snippet_paths = watermark_snippets(snippet_paths)
 
-    upload_snippets(vimeo_client, snippet_paths)
+    upload_snippets(process_data.vimeo_client, snippet_paths)
 
     rm_path(tmp_folder_path)
     print("Cleaned up processed files")
@@ -685,15 +681,15 @@ def pull_action(c: Pull):
     df.to_csv(c.out_path, index=False)
     print(f'Saved vimeo video data to {c.out_path}')
 def insert_only_action(c: InsertOnly):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.collections)
 
 def insert_and_process_action(c: InsertAndProcess):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
-    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.add_workorder, c.vimeo_client)
+    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.process_data.collections)
+    process_collections(c.process_data)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.add_workorder, c.vimeo_client)
+    process_collections(c.process_data)
 
 
 def main():
