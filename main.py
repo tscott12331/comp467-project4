@@ -53,6 +53,7 @@ class InsertAndProcess(BaseModel):
     workorder_col: Collection
     video_path: Path
     should_watermark: bool
+    add_workorder: bool
     out_path: Path
     vimeo_client: VimeoClient
 
@@ -64,6 +65,7 @@ class ReadAndProcess(BaseModel):
     workorder_col: Collection
     video_path: Path
     should_watermark: bool
+    add_workorder: bool
     out_path: Path
     vimeo_client: VimeoClient
 
@@ -132,6 +134,7 @@ def conf_argparse() -> argparse.Namespace:
     
     parser.add_argument('-w', '--watermark', help="watermark snippets before upload", action="store_true")
 
+    parser.add_argument('--workorder', help="include workorder data in exported xlsx", action="store_true")
     parser.add_argument('-o', '--out', help="output path for processed frames xls or pulled vimeo data csv")
     
     group = parser.add_mutually_exclusive_group()
@@ -170,6 +173,7 @@ def get_config(args: argparse.Namespace) -> Config:
 
     video_path_str = args.process
     should_watermark = args.watermark
+    add_workorder = args.workorder
     out_path_str = args.out
     pull = args.pull
 
@@ -194,6 +198,7 @@ def get_config(args: argparse.Namespace) -> Config:
                                   frame_col=frame_col, 
                                   workorder_col=workorder_col,
                                   video_path=video_path, 
+                                  add_workorder=add_workorder,
                                   out_path=out_path, 
                                   should_watermark=should_watermark, 
                                   vimeo_client=vimeo_client)
@@ -203,6 +208,7 @@ def get_config(args: argparse.Namespace) -> Config:
                                     frame_col=frame_col, 
                                     workorder_col=workorder_col,
                                     video_path=video_path, 
+                                    add_workorder=add_workorder,
                                     out_path=out_path, 
                                     should_watermark=should_watermark, 
                                     vimeo_client=vimeo_client)
@@ -575,13 +581,9 @@ def get_col_widths(data: list[dict[str, str]]):
 
 
 
-def export_xlsx(handle_frame_data: HandleFrameData, thumb_paths: list[Path], out_path: Path):
+def export_xlsx(handle_frame_data: HandleFrameData, thumb_paths: list[Path], out_path: Path, add_workorder: bool):
     export_records = prepare_handle_frame_data_export(handle_frame_data.frame_entries)
     widths = get_col_widths(export_records)
-
-    frame_df = pandas.DataFrame.from_records(export_records)
-    workorder_df = pandas.DataFrame.from_records(handle_frame_data.workorder_data, index=[0], 
-                                                 columns=['Workorder', 'Producer', 'Operator', 'Job'])
 
     # insert text data into xlsx
     writer = pandas.ExcelWriter(out_path, engine='xlsxwriter')
@@ -589,11 +591,15 @@ def export_xlsx(handle_frame_data: HandleFrameData, thumb_paths: list[Path], out
     startrow = 0
     sheet_name = "Sheet1"
 
-    workorder_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
-    
-    # workorder title + row + space
-    startrow += 3
+    if add_workorder:
+        workorder_df = pandas.DataFrame.from_records(handle_frame_data.workorder_data, index=[0], 
+                                                 columns=['Workorder', 'Producer', 'Operator', 'Job'])
+        workorder_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
+        
+        # workorder title + row + space
+        startrow += 3
 
+    frame_df = pandas.DataFrame.from_records(export_records)
     frame_df.to_excel(writer, sheet_name=sheet_name, index=False, startrow=startrow)
 
     worksheet: Worksheet = writer.sheets["Sheet1"]
@@ -634,11 +640,11 @@ def rm_path(path: Path):
         path.unlink(missing_ok=True)
 
 
-def process_collections(video_path: Path, frame_col: Collection, workorder_col: Collection, out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
+def process_collections(video_path: Path, frame_col: Collection, workorder_col: Collection, out_path: Path, should_watermark: bool, add_workorder: bool, vimeo_client: VimeoClient):
     frame_data = read_frame_data(frame_col, workorder_col)
-    process(video_path, frame_data, out_path, should_watermark, vimeo_client)
+    process(video_path, frame_data, out_path, should_watermark, add_workorder, vimeo_client)
 
-def process(video_path: Path, frame_data: FrameData, out_path: Path, should_watermark: bool, vimeo_client: VimeoClient):
+def process(video_path: Path, frame_data: FrameData, out_path: Path, should_watermark: bool, add_workorder: bool, vimeo_client: VimeoClient):
     video_data = get_video_data(video_path)
 
     handle_frame_data = get_range_handles_below_thresh(frame_data, video_data.nb_frames, video_data.fps)
@@ -648,7 +654,7 @@ def process(video_path: Path, frame_data: FrameData, out_path: Path, should_wate
 
     # create thumbs and export xls
     thumb_paths = [create_thumbnail(path) for path in snippet_paths]
-    export_xlsx(handle_frame_data, thumb_paths, out_path)
+    export_xlsx(handle_frame_data, thumb_paths, out_path, add_workorder)
 
     if should_watermark:
         snippet_paths = watermark_snippets(snippet_paths)
@@ -683,11 +689,11 @@ def insert_only_action(c: InsertOnly):
 
 def insert_and_process_action(c: InsertAndProcess):
     insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.frame_col, c.workorder_col)
-    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.vimeo_client)
+    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.add_workorder, c.vimeo_client)
 
 
 def read_and_process_action(c: ReadAndProcess):
-    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.vimeo_client)
+    process_collections(c.video_path, c.frame_col, c.workorder_col, c.out_path, c.should_watermark, c.add_workorder, c.vimeo_client)
 
 
 def main():
