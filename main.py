@@ -218,8 +218,8 @@ def insert_dataframe(col: Collection, df: pandas.DataFrame) -> Collection:
 
     return col
 
-def insert_frame_files(baselight_path: Path, xytech_path: Path, collections: MongoCollections):
-    collection_data = process_frame_files(str(baselight_path), str(xytech_path))
+def insert_frame_files(frame_paths: FramePaths, collections: MongoCollections):
+    collection_data = process_frame_files(frame_paths)
     insert_dataframe(collections.frame_col, collection_data.frame_dataframe)
     insert_dataframe(collections.workorder_col, collection_data.workorder_dataframe)
 
@@ -262,7 +262,7 @@ def frames_to_ranges(frames:list[str]) -> list[str]:
 
         return out
 
-def process_xytech(file_name:str) -> XytechData:
+def process_xytech(xytech_path: Path) -> XytechData:
     unique_paths: dict[str,str] = {}
     workorder_data: WorkorderData = {
                 'Job': '',
@@ -270,7 +270,7 @@ def process_xytech(file_name:str) -> XytechData:
                 'Producer': '',
                 'Workorder': ''
             }
-    with open(file_name) as file:
+    with open(xytech_path) as file:
         for line in file.readlines():
             xytech_match = re.search(xytech_re, line)
             if xytech_match is None:
@@ -289,8 +289,8 @@ def process_xytech(file_name:str) -> XytechData:
             'WorkorderData': workorder_data
             }
 
-def process_frame_files(frame_file_path:str, relevant_paths_file_path:str) -> CollectionData:
-    xytech_data = process_xytech(relevant_paths_file_path)
+def process_frame_files(frame_paths: FramePaths) -> CollectionData:
+    xytech_data = process_xytech(frame_paths.xytech)
     unique_paths = xytech_data['UniquePaths']
 
     frame_data = {
@@ -298,7 +298,7 @@ def process_frame_files(frame_file_path:str, relevant_paths_file_path:str) -> Co
             'Frames': [],
     }
 
-    with open(frame_file_path) as frame_file:
+    with open(frame_paths.baselight) as frame_file:
         for export_line in frame_file.readlines():
             path_match = re.search(baselight_path_re, export_line)
             if path_match is None:
@@ -681,10 +681,10 @@ def pull_action(c: Pull):
     df.to_csv(c.out_path, index=False)
     print(f'Saved vimeo video data to {c.out_path}')
 def insert_only_action(c: InsertOnly):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.collections)
+    insert_frame_files(c.frame_paths, c.collections)
 
 def insert_and_process_action(c: InsertAndProcess):
-    insert_frame_files(c.frame_paths.baselight, c.frame_paths.xytech, c.process_data.collections)
+    insert_frame_files(c.frame_paths, c.process_data.collections)
     process_collections(c.process_data)
 
 
